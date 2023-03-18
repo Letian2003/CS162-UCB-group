@@ -5,6 +5,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "list.h"
+#include "stddef.h"
 #include "userprog/gdt.h"
 #include "userprog/pagedir.h"
 #include "userprog/tss.h"
@@ -18,6 +20,7 @@
 #include "threads/palloc.h"
 #include "threads/synch.h"
 #include "threads/thread.h"
+#include "userprog/syscall.h"
 #include "threads/vaddr.h"
 
 static struct semaphore temporary;
@@ -25,6 +28,7 @@ static thread_func start_process NO_RETURN;
 static thread_func start_pthread NO_RETURN;
 static bool load(const char* file_name, void (**eip)(void), void** esp);
 bool setup_thread(void (**eip)(void), void** esp);
+
 
 /* Initializes user programs in the system by ensuring the main
    thread has a minimal PCB so that it can execute and wait for
@@ -41,38 +45,151 @@ void userprog_init(void) {
      can come at any time and activate our pagedir */
     t->pcb = calloc(sizeof(struct process), 1);
     success = t->pcb != NULL;
+    t->pcb->main_thread = t;
+    t->pcb->fd_num = 2;
+
+    list_init(&t->pcb->children_processes);
+    list_init(&t->pcb->fd_list);
+    /* process_status */
+    list_init(&process_all_status_list);
+    list_init(&file_status_list);
+    
+    struct process_status* ps = malloc(sizeof(struct process_status)); 
+    if(ps == NULL){
+        printf("malloc\n");
+        process_exit();
+    }
+    init_process_status(ps, t->tid);
 
     /* Kill the kernel if we did not succeed */
     ASSERT(success);
+}
+
+struct arguments {
+    char* fn_copy;
+    char** argv;
+    int argc;
+    struct file* File;
+    struct semaphore sema;
+    int status;
+};
+
+static void free_args(struct arguments* args) {
+    for (int i = 0; i < args->argc; i++) {
+        free(args->argv[i]);
+    }
+    free(args->argv);
+}
+
+static void push_arg(struct arguments* args, char* arg) {
+    args->argv = (char**)realloc(args->argv, sizeof(char*) * (args->argc + 1));
+    if (args->argv == NULL) {
+        printf("Realloc failed.");
+        process_exit();
+    }
+    args->argv[args->argc] = arg;
+    args->argc++;
+}
+
+static void parse_to(struct arguments* args, const char* task) {
+    args->argv = NULL;
+    args->argc = 0;
+    
+
+    char *token = NULL, *psave = NULL;
+    int len = strlen(task);
+    char* str = malloc(len + 1);
+    if (str == NULL) {
+        printf("Malloc failed.");
+        process_exit();
+    }
+    strlcpy(str, task, len + 1);
+
+    token = strtok_r(str, " ", &psave);
+    while (token != NULL) {
+        len = strlen(token);
+        char* arg = malloc(len + 1);
+        if (arg == NULL) {
+            printf("Malloc failed.");
+            process_exit();
+        }
+        strlcpy(arg, token, len + 1);
+        push_arg(args, arg);
+        token = strtok_r(NULL, " ", &psave);
+    }
+    free(str);
 }
 
 /* Starts a new thread running a user program loaded from
    FILENAME.  The new thread may be scheduled (and may even exit)
    before process_execute() returns.  Returns the new process's
    process id, or TID_ERROR if the thread cannot be created. */
-pid_t process_execute(const char* file_name) {
-    char* fn_copy;
+pid_t process_execute(const char* task ) {
+    struct arguments* args = malloc(sizeof(struct arguments));
+    if (args == NULL) {
+        printf("Malloc failed.");
+        process_exit();
+    }
+    parse_to(args, task);
+
+    const char* file_name = args->argv[0];
     tid_t tid;
 
     sema_init(&temporary, 0);
     /* Make a copy of FILE_NAME.
      Otherwise there's a race between the caller and load(). */
-    fn_copy = palloc_get_page(0);
-    if (fn_copy == NULL)
+    args->fn_copy = palloc_get_page(0);
+    if (args->fn_copy == NULL)
         return TID_ERROR;
-    strlcpy(fn_copy, file_name, PGSIZE);
+    strlcpy(args->fn_copy, file_name, PGSIZE);
 
-    /* Create a new thread to execute FILE_NAME. */
-    tid = thread_create(file_name, PRI_DEFAULT, start_process, fn_copy);
-    if (tid == TID_ERROR)
-        palloc_free_page(fn_copy);
+    /* exec-missing */
+    /* if file_name doesn't exist , return -1 */
+
+    // printf("<process_execute 1>\n");
+    lock_acquire(&file_lock);
+    struct file* file = filesys_open(file_name);
+    lock_release(&file_lock);
+    if (file == NULL){
+        tid = TID_ERROR;
+    }
+    else{
+        args->File = file;
+        args->status = 1;
+        sema_init(&args->sema,0);
+        /* Create a new thread to execute FILE_NAME. */
+        tid = thread_create(file_name, PRI_DEFAULT, start_process, args);
+        while(!sema_try_down(&args->sema)){
+            thread_yield();
+        }
+
+        if(args->status == 0){
+            tid = TID_ERROR;
+        }
+        /* process_status */
+    }
+    
+    // printf("<process_execute 2>\n");
+    // if (tid == TID_ERROR)
+    //     palloc_free_page(args->fn_copy);
+    
+    // if (tid != TID_ERROR){
+    //     struct process_status* new_ps = malloc(sizeof(struct process_status)); 
+    //     init_process_status(new_ps , tid);
+    // }
+
+    // printf("<process_execute>\n");
+    // print_ps();
+
     return tid;
 }
 
 /* A thread function that loads a user process and starts it
    running. */
-static void start_process(void* file_name_) {
-    char* file_name = (char*)file_name_;
+static void start_process(void* aux) {
+    struct arguments* args = (struct arguments*)aux;
+    char* file_name = (char*)args->fn_copy;
+    struct file* file = args->File;
     struct thread* t = thread_current();
     struct intr_frame if_;
     bool success, pcb_success;
@@ -80,18 +197,52 @@ static void start_process(void* file_name_) {
     /* Allocate process control block */
     struct process* new_pcb = malloc(sizeof(struct process));
     success = pcb_success = new_pcb != NULL;
+    /* Allocate process_status */
 
+    
     /* Initialize process control block */
     if (success) {
         // Ensure that timer_interrupt() -> schedule() -> process_activate()
         // does not try to activate our uninitialized pagedir
         new_pcb->pagedir = NULL;
+        list_init(&new_pcb->children_processes);
+        list_init(&new_pcb->fd_list);
+
         t->pcb = new_pcb;
+        t->pcb->main_thread = t;
+        t->pcb->fd_num = 2;
+
+        /* debug 
+        print_ps();
+        */
+        t->pcb->file = file;
+        file_deny_write(file);
+
+        /* malloc ps */
+        struct process_status* new_ps = malloc(sizeof(struct process_status)); 
+        if(new_ps == NULL){
+            printf("malloc\n");
+            process_exit();
+        }
+        int pid = thread_current()->tid;
+        init_process_status(new_ps , pid);
+        
+        struct children_process* cp = malloc(sizeof(struct children_process));
+        if(cp == NULL){
+            printf("malloc\n");
+            process_exit();
+        }
+        cp->ps = new_ps;
+        list_push_back(&new_pcb->children_processes , &cp->elem);
 
         // Continue initializing the PCB as normal
-        t->pcb->main_thread = t;
+        
         strlcpy(t->pcb->process_name, t->name, sizeof t->name);
+        // print_ps();
     }
+
+    
+    // file_allow_write(file);
 
     /* Initialize interrupt frame and load executable. */
     if (success) {
@@ -99,9 +250,13 @@ static void start_process(void* file_name_) {
         if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
         if_.cs = SEL_UCSEG;
         if_.eflags = FLAG_IF | FLAG_MBS;
+        lock_acquire(&file_lock);
+        // printf("<load 1>\n");
         success = load(file_name, &if_.eip, &if_.esp);
+        // printf("<load 2>\n");
+        lock_release(&file_lock);
     }
-
+    
     /* Handle failure with succesful PCB malloc. Must free the PCB */
     if (!success && pcb_success) {
         // Avoid race where PCB is freed before t->pcb is set to NULL
@@ -111,13 +266,54 @@ static void start_process(void* file_name_) {
         t->pcb = NULL;
         free(pcb_to_free);
     }
-
+    
+    args->status = (int) success; 
+    sema_up(&args->sema);
     /* Clean up. Exit on failure or jump to userspace */
     palloc_free_page(file_name);
     if (!success) {
         sema_up(&temporary);
         thread_exit();
     }
+    
+    /* Simulate the Program Startup. */
+    char** argv = malloc(sizeof(char*) * args->argc);
+    if (argv == NULL) {
+        printf("Malloc failed.");
+        thread_exit();
+    }
+
+    int total_len = 0;
+    for (int i = args->argc - 1; i >= 0; --i) {
+        int len = strlen(args->argv[i]);
+        if_.esp -= len + 1;
+        total_len += len + 1;
+        memcpy(if_.esp, args->argv[i], len + 1);
+        argv[i] = if_.esp;
+    }
+    argv[args->argc] = 0;
+
+    total_len += (args->argc + 3) * 4;
+    if (total_len % 16 != 0) {
+        total_len = 16 - (total_len % 16);
+    } else {
+        total_len = 0;
+    }
+    if_.esp -= total_len;
+    memset(if_.esp, 0, total_len);
+
+    for (int i = args->argc; i >= 0; --i) {
+        if_.esp -= 4;
+        memcpy(if_.esp, &argv[i], 4);
+    }
+    free(argv);
+
+    char* addr = if_.esp;
+    if_.esp -= 4;
+    memcpy(if_.esp, &addr, 4);
+    if_.esp -= 4;
+    memcpy(if_.esp, &args->argc, 4);
+    free_args(args);
 
     /* Start the user process by simulating a return from an
      interrupt, implemented by intr_exit (in
@@ -125,6 +321,12 @@ static void start_process(void* file_name_) {
      arguments on the stack in the form of a `struct intr_frame',
      we just point the stack pointer (%esp) to our stack frame
      and jump to it. */
+    if_.esp -= 4;
+
+    
+    // char buf[100];
+    // hex_dump((unsigned int)if_.esp, buf, 100, true);
+    // printf("%s", buf);
     asm volatile("movl %0, %%esp; jmp intr_exit" : : "g"(&if_) : "memory");
     NOT_REACHED();
 }
@@ -138,9 +340,87 @@ static void start_process(void* file_name_) {
 
    This function will be implemented in problem 2-2.  For now, it
    does nothing. */
-int process_wait(pid_t child_pid UNUSED) {
-    sema_down(&temporary);
-    return 0;
+static bool vertify_child(struct process* pcb,pid_t child_pid){
+    if(get_pid(pcb)<=1){
+        return true;
+    }
+    
+    struct list* children = &pcb->children_processes;
+    for(struct list_elem* elem = list_begin(children); elem != list_end(children);elem = list_next(elem)){
+        struct children_process* cp = list_entry(elem,struct children_process,elem);
+        if(cp==NULL){
+            continue;
+        }
+        struct process_status* ps = cp->ps;
+        if(ps==NULL){
+            continue;
+        }
+        // printf("<vertify_child>\n");
+        // prints_ps(ps);
+        if(ps->pid == child_pid){
+            return true;
+        }
+    }
+    return false;
+}
+
+int process_wait(pid_t child_pid) {
+    // printf("<process_wait>\n");
+    // printf("pid = %d\n",child_pid);
+
+
+    struct process_status* ps = NULL;
+    ps = get_ps(child_pid);
+    for (struct list_elem* elem = list_begin(&thread_current()->pcb->children_processes); elem != list_end(&thread_current()->pcb->children_processes); elem = list_next(elem)){
+        struct children_process* cp = list_entry(elem,struct children_process,elem);
+        if(cp==NULL)
+            continue;
+        if(cp->ps->pid==child_pid){
+            list_remove(elem);
+            free(cp);
+            break;
+        }
+    }
+
+    if(ps==NULL){
+        // printf("psNULL\n");
+        // sema_up(&temporary);
+        return -1;
+    }
+    while(!sema_try_down(&temporary)){
+        thread_yield();
+    }
+    // printf("<wait 1 %d>\n",child_pid);
+    struct process* pcb = thread_current()->pcb;
+    
+    if(ps->wait){
+        
+        printf("invalid child_pid\n");
+        // printf("<ps->wait> = %d\n",ps->wait);
+        sema_up(&temporary);
+        return -1;
+    }
+    
+    ps->wait=1;
+    
+    // printf("<wait 2 %d>\n",child_pid);
+    while(ps!=NULL && !ps->is_exited){
+        // printf("current : %d , child : %d , child->is_exited = %d\n",get_pid(pcb),child_pid,ps->is_exited);
+        sema_up(&temporary);
+        thread_yield();
+        while(!sema_try_down(&temporary)){
+            thread_yield();
+        }
+        
+    }
+    // printf("<wait 3 %d>\n",child_pid);
+    int ret = ps->exit_status;
+
+    list_remove(&ps->elem);
+    free(ps);
+    
+    sema_up(&temporary);
+    return ret;
 }
 
 /* Free the current process's resources. */
@@ -154,6 +434,11 @@ void process_exit(void) {
         NOT_REACHED();
     }
 
+
+    file_close(cur->pcb->file);
+    destroy_fd_list();
+    // destroy_children_processes();
+    
     /* Destroy the current process's page directory and switch back
      to the kernel-only page directory. */
     pd = cur->pcb->pagedir;
@@ -175,11 +460,14 @@ void process_exit(void) {
      If this happens, then an unfortuantely timed timer interrupt
      can try to activate the pagedir, but it is now freed memory */
     struct process* pcb_to_free = cur->pcb;
-    cur->pcb = NULL;
+    
+    cur->pcb = NULL ;
+    // printf("<pexit pid> %d\n",pcb_to_free->main_thread->tid);
     free(pcb_to_free);
 
     sema_up(&temporary);
     thread_exit();
+    
 }
 
 /* Sets up the CPU for running user code in the current
@@ -275,12 +563,14 @@ bool load(const char* file_name, void (**eip)(void), void** esp) {
     off_t file_ofs;
     bool success = false;
     int i;
+    
 
     /* Allocate and activate page directory. */
     t->pcb->pagedir = pagedir_create();
     if (t->pcb->pagedir == NULL)
         goto done;
     process_activate();
+    
 
     /* Open executable file. */
     file = filesys_open(file_name);
@@ -288,6 +578,7 @@ bool load(const char* file_name, void (**eip)(void), void** esp) {
         printf("load: %s: open failed\n", file_name);
         goto done;
     }
+
 
     /* Read and verify executable header. */
     if (file_read(file, &ehdr, sizeof ehdr) != sizeof ehdr ||
@@ -361,6 +652,7 @@ bool load(const char* file_name, void (**eip)(void), void** esp) {
 done:
     /* We arrive here whether the load is successful or not. */
     file_close(file);
+
     return success;
 }
 
@@ -533,7 +825,7 @@ tid_t pthread_execute(stub_fun sf UNUSED, pthread_fun tf UNUSED, void* arg UNUSE
 
    This function will be implemented in Project 2: Multithreading and
    should be similar to start_process (). For now, it does nothing. */
-static void start_pthread(void* exec_ UNUSED) {}
+UNUSED static void start_pthread(void* exec_ UNUSED) {}
 
 /* Waits for thread with TID to die, if that thread was spawned
    in the same process and has not been waited on yet. Returns TID on
@@ -564,3 +856,154 @@ void pthread_exit(void) {}
    This function will be implemented in Project 2: Multithreading. For
    now, it does nothing. */
 void pthread_exit_main(void) {}
+
+struct process_status* get_ps(pid_t pid){
+    struct process_status* ps = NULL;
+    for(struct list_elem* e = list_begin(&process_all_status_list); e != list_end(&process_all_status_list) ;
+        e = list_next(e)){
+            ps = list_entry(e,struct process_status, elem);
+            if(ps==NULL)
+                continue;
+            if(ps->pid == pid)
+                break;
+        }
+    if(ps == NULL || ps->pid!=pid)
+        return NULL;
+    return ps;
+}
+
+void print_ps(void){
+    struct process* pcb = thread_current()->pcb;
+    // printf("<print_ps>\n");
+    printf("<< process now : pid = %d , name = %s >>\n",get_pid(pcb),pcb->process_name);
+    struct process_status* ps = NULL;
+    for(struct list_elem* e = list_begin(&process_all_status_list); e != list_end(&process_all_status_list) ;
+        e = list_next(e)){
+            ps = list_entry(e,struct process_status, elem);
+            if(ps==NULL)
+                continue;
+            printf("{ pid = %4d , is_exited = %1d ,exit_status = %1d }\n",ps->pid,ps->is_exited,ps->exit_status);
+        }
+    // printf("</print_ps>\n");
+}
+
+void prints_ps(struct process_status* ps){   
+     printf("{ pid = %4d , is_exited = %1d ,exit_status = %1d }\n",ps->pid,ps->is_exited,ps->exit_status);;
+}
+
+void print_cp(struct list* children_processes){
+    printf("<print_cp>\n");
+    for(struct list_elem* elem = list_begin(children_processes);elem!=list_end(children_processes);
+        elem = list_next(elem)){
+            struct children_process* cp = list_entry(elem,struct children_process,elem);
+            if(cp==NULL)
+                continue;
+            struct process_status* ps = cp->ps;
+            if(ps==NULL)
+                continue;
+            prints_ps(ps); 
+        }
+
+    printf("</print_cp>\n");
+}
+
+void init_process_status(struct process_status* ps,pid_t pid){
+    if(ps==NULL)
+        return;
+    ps->pid = pid;
+    ps->is_exited = 0;
+    ps->wait=0;
+    ps->exit_status = 0;
+    list_push_back(&process_all_status_list, &ps->elem);
+}   
+
+struct file_status* get_fs(int fd){
+    struct process* pcb = thread_current() -> pcb;
+    struct process_fd* pfd = NULL;
+    for(struct list_elem* elem = list_begin(&pcb->fd_list); elem != list_end(&pcb->fd_list);
+        elem = list_next(elem)){
+            pfd = list_entry(elem,struct process_fd,elem);
+            if(pfd==NULL || pfd->fs==NULL)
+                continue;
+            if(pfd->fs->fd == fd)
+                break;
+        }
+    if(pfd==NULL || pfd->fs==NULL || pfd->fs->fd != fd)
+        return NULL;
+    return pfd->fs;
+}
+
+bool vertify_pfd(struct process* pcb, int fd){
+    if(fd<2)
+        return false;
+    struct process_fd* pfd = NULL;
+    for(struct list_elem* elem = list_begin(&pcb->fd_list); elem != list_end(&pcb->fd_list);
+        elem = list_next(elem)){
+            pfd = list_entry(elem,struct process_fd,elem);
+            if(pfd==NULL)
+                continue;
+            if(pfd->fs->fd == fd)
+                return true;
+        }
+    return false;
+}
+
+void destroy_fd_list(void){
+    // printf("<destroy_fd_list>\n");
+    // print_fd();
+    struct process* pcb = thread_current() -> pcb;
+    struct process_fd* pfd = NULL;
+    struct list_elem* next = NULL;
+    for(struct list_elem* elem = list_begin(&pcb->fd_list); elem != list_end(&pcb->fd_list);
+        elem = next){
+            next = list_next(elem);
+            pfd = list_entry(elem,struct process_fd,elem);
+            if(pfd==NULL || pfd->fs==NULL)
+                continue;
+            // printf("close %d\n",pfd->fs->fd);
+            sys_close(pfd->fs->fd);
+            
+        }
+    // printf("</destroy_fd_list>\n");
+    // print_fd();
+}
+
+void print_fd(void){
+    // printf("<print_fd>\n");
+    struct process* pcb = thread_current() -> pcb;
+    struct process_fd* pfd = NULL;
+    // printf("<<pid = %d>>\n",get_pid(pcb));
+    for(struct list_elem* elem = list_begin(&pcb->fd_list); elem != list_end(&pcb->fd_list);
+        elem = list_next(elem)){
+            pfd = list_entry(elem,struct process_fd,elem);
+            if(pfd==NULL || pfd->fs==NULL)
+                continue;
+            printf("{ fd = %2d , is_closed = %d }\n",pfd->fs->fd,pfd->fs->is_closed);
+        }
+    // printf("</print_fd>\n");
+}
+
+void destroy_children_processes(void){
+    
+    struct process* pcb = thread_current() -> pcb;
+    // printf("<destroy_children_processes>\n");
+    // print_cp(&pcb->children_processes);
+    struct list* children_processes = &pcb->children_processes;
+    struct list_elem* nxt;
+    for(struct list_elem* elem = list_begin(children_processes);elem!=list_end(children_processes);
+        elem = nxt){
+            nxt = list_next(elem);
+            struct children_process* cp = list_entry(elem,struct children_process,elem);
+            if(cp==NULL)
+                continue;
+            struct process_status* ps = cp->ps;
+            if(ps==NULL)
+                continue;
+            list_remove(&ps->elem);
+            free(ps);
+            list_remove(elem);
+            free(cp);
+    }
+    // printf("</destroy_children_processes>\n");
+    // print_cp(&pcb->children_processes);
+}

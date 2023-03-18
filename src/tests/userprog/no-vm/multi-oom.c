@@ -48,34 +48,43 @@ static void consume_some_resources(void) {
      the kernel, open() may fail if the kernel is low on memory.
      A low-memory condition in open() should not lead to the
      termination of the process.  */
-  for (fd = 0; fd < fdmax; fd++)
+  for (fd = 0; fd < fdmax; fd++){
+    // printf("<consume_some_resources open %d>\n",fd);
     if (open(test_name) == -1)
       break;
+  }
 }
 
 /* Consume some resources, then terminate this process
    in some abnormal way.  */
 static int NO_INLINE consume_some_resources_and_die(int seed) {
+    // printf("<consume_some_resources_and_die 1>\n");
   consume_some_resources();
+    
   random_init(seed);
   volatile int* PHYS_BASE = (volatile int*)0xC0000000;
-
+    // printf("<consume_some_resources_and_die 2>\n");
   switch (random_ulong() % 5) {
     case 0:
+        // printf("<consume_some_resources_and_die -0>\n");
       *(volatile int*)NULL = 42;
       __attribute__((fallthrough));
 
     case 1:
+        // printf("<consume_some_resources_and_die -1>\n");
       return *(volatile int*)NULL;
 
     case 2:
+        // printf("<consume_some_resources_and_die -2>\n");
       return *PHYS_BASE;
 
     case 3:
+        // printf("<consume_some_resources_and_die -3>\n");
       *PHYS_BASE = 42;
       __attribute__((fallthrough));
 
     case 4:
+        // printf("<consume_some_resources_and_die -4>\n");
       open((char*)PHYS_BASE);
       exit(-1);
 
@@ -106,14 +115,17 @@ int main(int argc, char* argv[]) {
 
   /* If -k is passed, crash this process. */
   if (argc > 2 && !strcmp(argv[2], "-k")) {
+    // printf("<multi 1>\n");
     consume_some_resources_and_die(n);
+    // printf("<multi 2>\n");
     NOT_REACHED();
   }
-
+    // printf("<multi 2.1>\n");
   int howmany = is_at_root ? EXPECTED_REPETITIONS : 1;
   int i, expected_depth = -1;
 
   for (i = 0; i < howmany; i++) {
+    // printf("<multi-oom> i = %d \n",i);
     pid_t child_pid;
 
     /* Spawn a child that will be abnormally terminated.
@@ -130,6 +142,7 @@ int main(int argc, char* argv[]) {
     }
 
     /* Now spawn the child that will recurse. */
+    // printf("<multi 2.2>\n");
     child_pid = spawn_child(n + 1, RECURSE);
 
     /* If maximum depth is reached, return result. */
@@ -137,6 +150,7 @@ int main(int argc, char* argv[]) {
       return n;
 
     /* Else wait for child to report how deeply it was able to recurse. */
+    // printf("<multi 2.3>\n");
     int reached_depth = wait(child_pid);
     if (reached_depth == -1)
       fail("wait returned -1.");
@@ -144,6 +158,7 @@ int main(int argc, char* argv[]) {
     /* Record the depth reached during the first run; on subsequent
          runs, fail if those runs do not match the depth achieved on the
          first run. */
+    // printf("<multi 2.4>\n");
     if (i == 0)
       expected_depth = reached_depth;
     else if (expected_depth != reached_depth)
@@ -151,15 +166,17 @@ int main(int argc, char* argv[]) {
            reached_depth);
     ASSERT(expected_depth == reached_depth);
   }
+//   printf("<multi 3>\n");
 
   consume_some_resources();
-
+    // printf("<multi 4>\n");
   if (n == 0) {
     if (expected_depth < EXPECTED_DEPTH_TO_PASS)
       fail("should have forked at least %d times.", EXPECTED_DEPTH_TO_PASS);
     msg("success. program forked %d times.", howmany);
     msg("end");
   }
+//   printf("<multi 5>\n");
 
   return expected_depth;
 }
